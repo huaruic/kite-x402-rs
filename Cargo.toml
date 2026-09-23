@@ -1,5 +1,5 @@
 [package]
-name = "kite-x402-rust-axum"
+name = "kite-x402-axum"
 version = "0.1.0"
 edition = "2024"
 # Matches the `go 1.25` floor the Go template pins. 1.88 is the highest MSRV
@@ -7,7 +7,11 @@ edition = "2024"
 rust-version = "1.88"
 description = "Wrap any HTTP API as an x402 paid service settled on the Kite chain"
 license = "Apache-2.0"
-repository = "https://github.com/huaruic/kite-x402-rust-axum"
+repository = "https://github.com/huaruic/kite-x402-rs"
+homepage = "https://github.com/huaruic/kite-x402-rs"
+readme = "README.md"
+keywords = ["x402", "kite", "axum", "payments", "agents"]
+categories = ["web-programming::http-server", "api-bindings"]
 
 [dependencies]
 axum = "0.8.9"

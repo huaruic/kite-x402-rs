@@ -20,8 +20,8 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --no-create-home kite
-COPY --from=build /src/target/release/kite-x402-rust-axum /usr/local/bin/
+COPY --from=build /src/target/release/kite-x402-axum /usr/local/bin/
 USER kite
 ENV PORT=8080
 EXPOSE 8080
-CMD ["kite-x402-rust-axum"]
+CMD ["kite-x402-axum"]
