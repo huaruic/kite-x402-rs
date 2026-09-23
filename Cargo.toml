@@ -2,6 +2,12 @@
 name = "kite-x402-rust-axum"
 version = "0.1.0"
 edition = "2024"
+# Matches the `go 1.25` floor the Go template pins. 1.88 is the highest MSRV
+# among the dependencies, and also what the let-chains in main.rs need.
+rust-version = "1.88"
+description = "Wrap any HTTP API as an x402 paid service settled on the Kite chain"
+license = "Apache-2.0"
+repository = "https://github.com/huaruic/kite-x402-rust-axum"
 
 [dependencies]
 axum = "0.8.9"
