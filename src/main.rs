@@ -154,10 +154,7 @@ async fn main() {
         app.upstream, app.chain.network, app.price_label, app.requirements.pay_to
     );
 
-    let router = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/v1/{*path}", any(paid))
-        .with_state(app);
+    let router = router(app);
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -170,6 +167,13 @@ async fn main() {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
+}
+
+fn router(app: Arc<App>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/v1/{*path}", any(paid))
+        .with_state(app)
 }
 
 /// Free, so load balancers and the catalog can probe the service.
@@ -400,4 +404,295 @@ async fn forward(
         headers,
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end tests for the one rule the whole template exists to enforce:
+    //! verify -> upstream -> settle, and settle only when the upstream answered
+    //! below 400. A fake facilitator and a fake upstream run in-process and
+    //! count the calls they receive.
+
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Calls {
+        verify: AtomicUsize,
+        settle: AtomicUsize,
+        upstream: AtomicUsize,
+        payment_valid: AtomicBool,
+        settle_succeeds: AtomicBool,
+    }
+
+    impl Calls {
+        fn counts(&self) -> (usize, usize, usize) {
+            (
+                self.verify.load(Ordering::SeqCst),
+                self.upstream.load(Ordering::SeqCst),
+                self.settle.load(Ordering::SeqCst),
+            )
+        }
+    }
+
+    async fn serve(router: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn fake_facilitator(calls: Arc<Calls>) -> String {
+        let verify_calls = calls.clone();
+        let settle_calls = calls.clone();
+        serve(
+            Router::new()
+                .route(
+                    "/verify",
+                    axum::routing::post(move || {
+                        let c = verify_calls.clone();
+                        async move {
+                            c.verify.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(serde_json::json!({
+                                "isValid": c.payment_valid.load(Ordering::SeqCst),
+                                "invalidReason": "insufficient_funds",
+                                "payer": "0x857b",
+                            }))
+                        }
+                    }),
+                )
+                .route(
+                    "/settle",
+                    axum::routing::post(move || {
+                        let c = settle_calls.clone();
+                        async move {
+                            c.settle.fetch_add(1, Ordering::SeqCst);
+                            axum::Json(serde_json::json!({
+                                "success": c.settle_succeeds.load(Ordering::SeqCst),
+                                "errorReason": "settle_rejected",
+                                "transaction": "0xfeed",
+                                "network": "eip155:2366",
+                            }))
+                        }
+                    }),
+                ),
+        )
+        .await
+    }
+
+    async fn fake_upstream(calls: Arc<Calls>) -> String {
+        let ok_calls = calls.clone();
+        let boom_calls = calls.clone();
+        serve(
+            Router::new()
+                .route(
+                    "/ok",
+                    get(move || {
+                        let c = ok_calls.clone();
+                        async move {
+                            c.upstream.fetch_add(1, Ordering::SeqCst);
+                            "upstream body"
+                        }
+                    }),
+                )
+                .route(
+                    "/boom",
+                    get(move || {
+                        let c = boom_calls.clone();
+                        async move {
+                            c.upstream.fetch_add(1, Ordering::SeqCst);
+                            (StatusCode::INTERNAL_SERVER_ERROR, "upstream is down")
+                        }
+                    }),
+                ),
+        )
+        .await
+    }
+
+    /// A wrapper wired to the two fakes, priced at $0.001 on Kite mainnet.
+    async fn wrapper(calls: Arc<Calls>) -> String {
+        let upstream = fake_upstream(calls.clone()).await;
+        let facilitator = fake_facilitator(calls.clone()).await;
+        let http = reqwest::Client::new();
+        let chain = kite::KITE_MAINNET;
+        let app = Arc::new(App {
+            requirements: PaymentRequirements {
+                scheme: "exact".into(),
+                network: chain.network.into(),
+                asset: chain.asset_address.into(),
+                amount: kite::price_to_units("$0.001", &chain).unwrap().to_string(),
+                pay_to: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C".into(),
+                max_timeout_seconds: 60,
+                extra: Some(serde_json::json!({
+                    "name": chain.eip712_name,
+                    "version": chain.eip712_version,
+                })),
+            },
+            chain,
+            price_label: "$0.001".into(),
+            description: "test".into(),
+            upstream: reqwest::Url::parse(&upstream).unwrap(),
+            upstream_auth_header: "Authorization".into(),
+            upstream_auth_value: None,
+            facilitator: Facilitator::new(facilitator, http.clone()),
+            http,
+        });
+        serve(router(app)).await
+    }
+
+    fn signature() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "x402Version": 2,
+                "accepted": {"scheme": "exact", "network": "eip155:2366"},
+                "payload": {"signature": "0xdeadbeef"},
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn unpaid_request_is_challenged_and_never_reaches_the_upstream() {
+        let calls = Arc::new(Calls::default());
+        let base = wrapper(calls.clone()).await;
+
+        let response = reqwest::get(format!("{base}/v1/ok")).await.unwrap();
+        assert_eq!(response.status(), 402);
+        assert!(response.headers().contains_key("payment-required"));
+        // Nothing was verified, fetched or settled: the caller has not paid and
+        // the upstream's rate limit was not spent on them.
+        assert_eq!(calls.counts(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn rejected_payment_never_reaches_the_upstream() {
+        let calls = Arc::new(Calls::default());
+        calls.payment_valid.store(false, Ordering::SeqCst);
+        let base = wrapper(calls.clone()).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base}/v1/ok"))
+            .header(HEADER_PAYMENT_SIGNATURE, signature())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 402);
+        let challenge = response.headers().get("payment-required").unwrap();
+        assert!(!challenge.is_empty());
+        assert_eq!(calls.counts(), (1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_failing_upstream_is_relayed_without_settling() {
+        let calls = Arc::new(Calls::default());
+        calls.payment_valid.store(true, Ordering::SeqCst);
+        calls.settle_succeeds.store(true, Ordering::SeqCst);
+        let base = wrapper(calls.clone()).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base}/v1/boom"))
+            .header(HEADER_PAYMENT_SIGNATURE, signature())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 500);
+        assert!(response.headers().get("payment-response").is_none());
+        assert_eq!(response.text().await.unwrap(), "upstream is down");
+        // Verified and forwarded, but not charged. Reordering settle before the
+        // upstream call is what this assertion exists to catch.
+        assert_eq!(calls.counts(), (1, 1, 0));
+    }
+
+    #[tokio::test]
+    async fn a_successful_upstream_settles_once_and_returns_the_receipt() {
+        let calls = Arc::new(Calls::default());
+        calls.payment_valid.store(true, Ordering::SeqCst);
+        calls.settle_succeeds.store(true, Ordering::SeqCst);
+        let base = wrapper(calls.clone()).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base}/v1/ok"))
+            .header(HEADER_PAYMENT_SIGNATURE, signature())
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), 200);
+        let receipt = response
+            .headers()
+            .get("payment-response")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(response.text().await.unwrap(), "upstream body");
+
+        use base64::Engine as _;
+        let settled: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(receipt)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(settled["success"], true);
+        assert_eq!(settled["transaction"], "0xfeed");
+        assert_eq!(calls.counts(), (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_failed_settlement_withholds_the_upstream_body() {
+        let calls = Arc::new(Calls::default());
+        calls.payment_valid.store(true, Ordering::SeqCst);
+        calls.settle_succeeds.store(false, Ordering::SeqCst);
+        let base = wrapper(calls.clone()).await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{base}/v1/ok"))
+            .header(HEADER_PAYMENT_SIGNATURE, signature())
+            .send()
+            .await
+            .unwrap();
+
+        // The money did not move, so the caller does not get what it did not
+        // buy -- and the reason travels in PAYMENT-RESPONSE, per the spec.
+        assert_eq!(response.status(), 402);
+        assert!(response.headers().contains_key("payment-response"));
+        assert!(!response.text().await.unwrap().contains("upstream body"));
+        assert_eq!(calls.counts(), (1, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_payload_is_a_400_not_a_challenge() {
+        let calls = Arc::new(Calls::default());
+        let base = wrapper(calls.clone()).await;
+
+        for bad in ["not base64!!", "e30="] {
+            let response = reqwest::Client::new()
+                .get(format!("{base}/v1/ok"))
+                .header(HEADER_PAYMENT_SIGNATURE, bad)
+                .send()
+                .await
+                .unwrap();
+            // Retrying the same malformed header cannot succeed, so a 402
+            // challenge would send the client into a loop.
+            assert_eq!(response.status(), 400, "input: {bad}");
+        }
+        assert_eq!(calls.counts(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn healthz_is_free() {
+        let calls = Arc::new(Calls::default());
+        let base = wrapper(calls.clone()).await;
+        let response = reqwest::get(format!("{base}/healthz")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["network"], "eip155:2366");
+        assert_eq!(body["asset"], "USDC.e");
+        assert_eq!(calls.counts(), (0, 0, 0));
+    }
 }
