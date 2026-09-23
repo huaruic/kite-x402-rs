@@ -95,6 +95,27 @@ browser-gated tunnels do not work.
 cargo build --release   # ./target/release/kite-x402-rust-axum
 ```
 
+The [`Dockerfile`](Dockerfile) covers hosts that want a container, and Render,
+which has no native Rust runtime. It reads `PORT`, so platforms that inject
+their own need no change.
+
+```bash
+# Fly
+fly launch --internal-port 8080 --no-deploy
+fly secrets set PAY_TO=0x... UPSTREAM_URL=https://api.example.com PRICE_USD=0.001
+fly deploy
+
+# Render: New > Web Service > Docker, then set the same variables in the
+# dashboard. Leave PORT alone; Render injects it.
+```
+
+Set `UPSTREAM_AUTH_VALUE` as a secret, never as a build argument — it would be
+baked into an image layer.
+
+CI builds the image, starts it and asserts that `/healthz` answers and that an
+unpaid `/v1` request returns a 402 whose challenge carries the right network and
+amount, so a broken container fails the build rather than the deploy.
+
 See the [upstream repository README](https://github.com/gokite-ai/kite-x402-services)
 for the full flow and how to test with a Kite Passport agent.
 

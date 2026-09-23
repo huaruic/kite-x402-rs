@@ -22,3 +22,40 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+
+  docker:
+    name: container builds and serves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t kite-x402-rust-axum .
+      # A container that compiles but cannot answer is not a deployable
+      # template, so start it and drive the two routes that matter.
+      - name: the container serves /healthz and challenges /v1
+        run: |
+          set -euo pipefail
+          docker run -d --name svc -p 8080:8080 \
+            -e PAY_TO=0x209693Bc6afc0C5328bA36FaF03C514EF312287C \
+            -e KITE_NETWORK=mainnet \
+            -e UPSTREAM_URL=https://api.open-meteo.com \
+            -e PRICE_USD=0.001 \
+            kite-x402-rust-axum
+          for i in $(seq 1 30); do
+            curl -fsS localhost:8080/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          curl -fsS localhost:8080/healthz | tee /tmp/health
+          grep -q '"network":"eip155:2366"' /tmp/health
+
+          code=$(curl -s -o /tmp/body -w '%{http_code}' localhost:8080/v1/forecast)
+          [ "$code" = "402" ] || { echo "want 402, got $code"; docker logs svc; exit 1; }
+
+          challenge=$(curl -sD - -o /dev/null localhost:8080/v1/forecast \
+            | grep -i '^payment-required:' | sed 's/^[^:]*: *//' | tr -d '\r')
+          echo "$challenge" | base64 -d | tee /tmp/challenge
+          grep -q '"network":"eip155:2366"' /tmp/challenge
+          grep -q '"amount":"1000"' /tmp/challenge
+          echo "container serves the 402 challenge correctly"
+      - if: always()
+        run: docker rm -f svc || true
