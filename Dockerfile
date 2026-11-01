@@ -2,7 +2,7 @@
 # Run) or have no native Rust runtime (Render). The service reads PORT, so it
 # works unchanged on platforms that inject their own.
 
-FROM rust:1.88-bookworm AS build
+FROM rust:1.99-bookworm AS build
 # aws-lc-sys, the default rustls crypto provider, builds C through the cmake
 # crate. Without these the TLS dependency fails to compile.
 RUN apt-get update \
